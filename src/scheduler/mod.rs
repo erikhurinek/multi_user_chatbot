@@ -1,3 +1,4 @@
+use sqlx::SqlitePool;
 use std::collections::VecDeque;
 
 use futures_util::{StreamExt, stream::BoxStream};
@@ -5,12 +6,14 @@ use serde::Serialize;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
+use crate::db;
 use crate::llm::{LlmClient, LlmError, Message, Role};
 
 pub enum Command {
     Submit {
         request_id: Uuid,
         owner: Uuid,
+        author: String,
         prompt: String,
     },
     Cancel {
@@ -25,13 +28,36 @@ pub enum Command {
 #[derive(Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
-    Queued { request_id: Uuid, position: usize },
-    PositionChanged { request_id: Uuid, position: usize },
-    Started { request_id: Uuid },
-    Token { request_id: Uuid, text: String },
-    Finished { request_id: Uuid },
-    Cancelled { request_id: Uuid },
-    Failed { request_id: Uuid, reason: String },
+    Queued {
+        request_id: Uuid,
+        position: usize,
+    },
+    PositionChanged {
+        request_id: Uuid,
+        position: usize,
+    },
+    Started {
+        request_id: Uuid,
+    },
+    Token {
+        request_id: Uuid,
+        text: String,
+    },
+    Finished {
+        request_id: Uuid,
+    },
+    Cancelled {
+        request_id: Uuid,
+    },
+    Failed {
+        request_id: Uuid,
+        reason: String,
+    },
+    UserMessage {
+        request_id: Uuid,
+        author: String,
+        content: String,
+    },
 }
 
 #[derive(Clone)]
@@ -41,12 +67,13 @@ pub struct SchedulerHandle {
 }
 
 impl SchedulerHandle {
-    pub async fn submit(&self, owner: Uuid, prompt: String) -> Option<Uuid> {
+    pub async fn submit(&self, owner: Uuid, author: String, prompt: String) -> Option<Uuid> {
         let request_id = Uuid::new_v4();
         self.commands
             .send(Command::Submit {
                 request_id,
                 owner,
+                author,
                 prompt,
             })
             .await
@@ -73,11 +100,11 @@ impl SchedulerHandle {
     }
 }
 
-pub fn spawn(llm: LlmClient) -> SchedulerHandle {
+pub fn spawn(llm: LlmClient, pool: SqlitePool) -> SchedulerHandle {
     let (commands_tx, commands_rx) = mpsc::channel(32);
     let (events_tx, _) = broadcast::channel(256);
 
-    tokio::spawn(run(llm, commands_rx, events_tx.clone()));
+    tokio::spawn(run(llm, pool, commands_rx, events_tx.clone()));
 
     SchedulerHandle {
         commands: commands_tx,
@@ -94,6 +121,7 @@ struct Request {
 struct Active {
     id: Uuid,
     owner: Uuid,
+    reply: String,
     stream: BoxStream<'static, Result<String, LlmError>>,
 }
 
@@ -150,6 +178,7 @@ fn send_positions(queue: &VecDeque<Request>, events: &broadcast::Sender<Event>, 
 
 async fn run(
     llm: LlmClient,
+    pool: SqlitePool,
     mut commands: mpsc::Receiver<Command>,
     events: broadcast::Sender<Event>,
 ) {
@@ -169,13 +198,31 @@ async fn run(
             active = Some(Active {
                 id: req.id,
                 owner: req.owner,
+                reply: String::new(),
                 stream: llm.stream_chat(messages),
             })
         }
 
         tokio::select! {
             command = commands.recv() => match command {
-                Some(Command::Submit { request_id, owner, prompt }) => {
+                Some(Command::Submit { request_id, owner, author, prompt }) => {
+                    if let Err(e) = db::insert_message(
+                        &pool, db::CONVERSATION_ID, Role::User, Some(&author), &prompt,
+                    ).await {
+                        tracing::error!(%request_id, error = %e, "could not save user message");
+                        let _ = events.send(Event::Failed {
+                            request_id,
+                            reason: "could not save message".into(),
+                        });
+                        continue;
+                    }
+
+                    let _ = events.send(Event::UserMessage {
+                        request_id,
+                        author,
+                        content: prompt.clone(),
+                    });
+
                     let position = queue.len();
                     queue.push_back(Request { id: request_id, owner, prompt });
                     tracing::info!(%request_id, %owner, position, "request queued");
@@ -197,18 +244,30 @@ async fn run(
             },
 
             item = next_token(&mut active) => {
-                let Some(id) = active.as_ref().map(|a| a.id) else { continue };
+                let Some(a) = active.as_mut() else { continue };
+                let id = a.id;
+
                 match item {
                     Some(Ok(text)) => {
+                        a.reply.push_str(&text);
+                        tracing::trace!(%id, "token");
                         let _ = events.send(Event::Token { request_id: id, text });
                     }
                     Some(Err(e)) => {
+                        tracing::error!(request_id = %id, error = %e, "generation failed");
                         let _ = events.send(Event::Failed { request_id: id, reason: e.to_string() });
                         active=None;
                     }
                     None => {
-                        let _ = events.send(Event::Finished { request_id: id });
+                        let reply = std::mem::take(&mut a.reply);
                         active = None;
+                        if let Err(e) = db::insert_message(
+                            &pool, db::CONVERSATION_ID, Role::Assistant, None, &reply,
+                        ).await {
+                            tracing::error!(request_id = %id, error = %e, "could not save reply");
+                        }
+                        tracing::info!(request_id = %id, "generation finished");
+                        let _ = events.send(Event::Finished { request_id: id });
                     }
                 }
             }

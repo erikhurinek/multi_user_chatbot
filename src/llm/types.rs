@@ -8,6 +8,16 @@ pub enum Role {
     Assistant,
 }
 
+impl Role {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Message {
     pub role: Role,

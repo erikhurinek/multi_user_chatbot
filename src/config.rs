@@ -5,6 +5,7 @@ use anyhow::Context;
 pub struct Config {
     pub llama_url: String,
     pub bind_addr: SocketAddr,
+    pub database_url: String,
 }
 
 impl Config {
@@ -13,10 +14,12 @@ impl Config {
         let bind_addr = var_or("BIND_ADDR", "127.0.0.1:3000")
             .parse()
             .context("BIND_ADDR must look like 127.0.0.1:3000")?;
+        let database_url = var_or("DATABASE_URL", "sqlite://chat.db");
 
         Ok(Self {
             llama_url,
             bind_addr,
+            database_url,
         })
     }
 }
