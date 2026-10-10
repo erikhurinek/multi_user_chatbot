@@ -1,34 +1,37 @@
+mod config;
 mod llm;
+mod scheduler;
 
-use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::{
-    Json, Router,
-    body::Body,
-    extract::State,
-    http::header,
+    Router,
+    extract::{
+        State,
+        ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
+    },
     response::IntoResponse,
-    routing::{get, post},
+    routing::get,
 };
-use futures_util::StreamExt;
-use llm::{LlmClient, Message, Role};
+use config::Config;
+use llm::LlmClient;
+use scheduler::{Event, SchedulerHandle};
 use serde::Deserialize;
-use serde::Serialize;
+use tokio::sync::broadcast::error::RecvError;
+use tracing::Instrument;
+use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
 
 #[derive(Deserialize)]
-struct ChatBody {
-    prompt: String,
-}
-
-#[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum Event {
-    Token { text: String },
-    Finished,
-    Failed { reason: String },
+enum ClientMessage {
+    Submit { prompt: String },
+    Cancel { request_id: Uuid },
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(llm): State<LlmClient>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, llm))
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(scheduler): State<SchedulerHandle>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_socket(socket, scheduler))
 }
 
 async fn send_event(socket: &mut WebSocket, event: &Event) -> Result<(), axum::Error> {
@@ -36,66 +39,77 @@ async fn send_event(socket: &mut WebSocket, event: &Event) -> Result<(), axum::E
     socket.send(WsMessage::Text(json.into())).await
 }
 
-async fn handle_socket(mut socket: WebSocket, llm: LlmClient) {
-    while let Some(Ok(msg)) = socket.recv().await {
-        let WsMessage::Text(prompt) = msg else {
-            continue;
-        };
+async fn handle_socket(socket: WebSocket, scheduler: SchedulerHandle) {
+    let connection_id = Uuid::new_v4();
+    let span = tracing::info_span!("connection", %connection_id);
 
-        let messages = vec![Message {
-            role: Role::User,
-            content: prompt.as_str().to_owned(),
-        }];
-        let mut tokens = llm.stream_chat(messages);
+    async {
+        tracing::info!("client connected");
+        serve_connection(socket, &scheduler, connection_id).await;
+        scheduler.disconnect(connection_id).await;
+        tracing::info!("client disconnected");
+    }
+    .instrument(span)
+    .await;
+}
 
-        let outcome = loop {
-            match tokens.next().await {
-                Some(Ok(text)) => {
-                    if send_event(&mut socket, &Event::Token { text })
-                        .await
-                        .is_err()
-                    {
+async fn serve_connection(mut socket: WebSocket, scheduler: &SchedulerHandle, me: Uuid) {
+    let mut events = scheduler.subscribe();
+
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => match incoming {
+                Some(Ok(WsMessage::Text(text))) => {
+                    match serde_json::from_str::<ClientMessage>(text.as_str()) {
+                        Ok(ClientMessage::Submit { prompt }) => {
+                            if scheduler.submit(me, prompt).await.is_none() {
+                                return;
+                            }
+                        }
+                        Ok(ClientMessage::Cancel { request_id }) => {
+                            scheduler.cancel(me, request_id).await;
+                        }
+                        Err(e) => tracing::warn!("failed to parse client message: {e}"),
+                    }
+                }
+                Some(Ok(_)) => {}
+                _ => return,
+            },
+
+            event = events.recv() => match event {
+                Ok(event) => {
+                    if send_event(&mut socket, &event).await.is_err() {
                         return;
                     }
                 }
-                Some(Err(e)) => {
-                    break Event::Failed {
-                        reason: e.to_string(),
-                    };
+                Err(RecvError::Lagged(missed)) => {
+                    tracing::warn!(missed, "client too slow, events dropped");
                 }
-                None => break Event::Finished,
-            }
-        };
-
-        if send_event(&mut socket, &outcome).await.is_err() {
-            return;
+                Err(RecvError::Closed) => return,
+            },
         }
     }
 }
 
-async fn chat(State(llm): State<LlmClient>, Json(body): Json<ChatBody>) -> impl IntoResponse {
-    let messages = vec![Message {
-        role: Role::User,
-        content: body.prompt,
-    }];
-
-    (
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        Body::from_stream(llm.stream_chat(messages)),
-    )
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let llm = LlmClient::new("http://localhost:8080");
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
+    let config = Config::from_env()?;
+    tracing::info!(llama_url = %config.llama_url, bind = %config.bind_addr, "starting");
+
+    let scheduler = scheduler::spawn(LlmClient::new(&config.llama_url));
 
     let app = Router::new()
         .route("/health", get(|| async { "OK" }))
-        .route("/chat", post(chat))
         .route("/ws", get(ws_handler))
-        .with_state(llm);
+        .with_state(scheduler);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
     axum::serve(listener, app).await?;
 
     Ok(())
