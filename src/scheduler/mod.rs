@@ -6,8 +6,11 @@ use serde::Serialize;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
+use crate::chat;
 use crate::db;
 use crate::llm::{LlmClient, LlmError, Message, Role};
+
+const HISTORY_FETCH_LIMIT: i64 = 100;
 
 pub enum Command {
     Submit {
@@ -100,22 +103,20 @@ impl SchedulerHandle {
     }
 }
 
-pub fn spawn(llm: LlmClient, pool: SqlitePool) -> SchedulerHandle {
-    let (commands_tx, commands_rx) = mpsc::channel(32);
-    let (events_tx, _) = broadcast::channel(256);
+struct PartialReply {
+    request_id: Uuid,
+    text: String,
+}
 
-    tokio::spawn(run(llm, pool, commands_rx, events_tx.clone()));
-
-    SchedulerHandle {
-        commands: commands_tx,
-        events: events_tx,
-    }
+struct Cancellation {
+    count: usize,
+    partial: Option<PartialReply>,
 }
 
 struct Request {
     id: Uuid,
     owner: Uuid,
-    prompt: String,
+    user_message_id: i64,
 }
 
 struct Active {
@@ -123,6 +124,24 @@ struct Active {
     owner: Uuid,
     reply: String,
     stream: BoxStream<'static, Result<String, LlmError>>,
+}
+
+pub fn spawn(llm: LlmClient, pool: SqlitePool, prompt_char_budget: usize) -> SchedulerHandle {
+    let (commands_tx, commands_rx) = mpsc::channel(32);
+    let (events_tx, _) = broadcast::channel(256);
+
+    tokio::spawn(run(
+        llm,
+        pool,
+        prompt_char_budget,
+        commands_rx,
+        events_tx.clone(),
+    ));
+
+    SchedulerHandle {
+        commands: commands_tx,
+        events: events_tx,
+    }
 }
 
 async fn next_token(active: &mut Option<Active>) -> Option<Result<String, LlmError>> {
@@ -137,8 +156,8 @@ fn cancel_where(
     active: &mut Option<Active>,
     events: &broadcast::Sender<Event>,
     matches: impl Fn(Uuid, Uuid) -> bool,
-) -> usize {
-    let mut cancelled = 0;
+) -> Cancellation {
+    let mut count = 0;
     let mut index = 0;
     let mut first_removed: Option<usize> = None;
 
@@ -149,7 +168,7 @@ fn cancel_where(
         let hit = matches(r.id, r.owner);
         if hit {
             first_removed.get_or_insert(i);
-            cancelled += 1;
+            count += 1;
             let _ = events.send(Event::Cancelled { request_id: r.id });
         }
         !hit
@@ -159,12 +178,35 @@ fn cancel_where(
         send_positions(queue, events, from);
     }
 
+    let mut partial = None;
     if let Some(a) = active.take_if(|a| matches(a.id, a.owner)) {
-        cancelled += 1;
+        count += 1;
         let _ = events.send(Event::Cancelled { request_id: a.id });
+        if !a.reply.is_empty() {
+            partial = Some(PartialReply {
+                request_id: a.id,
+                text: a.reply,
+            })
+        }
     }
 
-    cancelled
+    Cancellation { count, partial }
+}
+
+async fn save_partial(pool: &SqlitePool, partial: Option<PartialReply>, status: db::Status) {
+    let Some(p) = partial else { return };
+    if let Err(e) = db::insert_message(
+        pool,
+        db::CONVERSATION_ID,
+        Role::Assistant,
+        None,
+        &p.text,
+        status,
+    )
+    .await
+    {
+        tracing::error!(request_id = %p.request_id, error = %e, "could not save partial reply");
+    }
 }
 
 fn send_positions(queue: &VecDeque<Request>, events: &broadcast::Sender<Event>, from: usize) {
@@ -179,6 +221,7 @@ fn send_positions(queue: &VecDeque<Request>, events: &broadcast::Sender<Event>, 
 async fn run(
     llm: LlmClient,
     pool: SqlitePool,
+    prompt_char_budget: usize,
     mut commands: mpsc::Receiver<Command>,
     events: broadcast::Sender<Event>,
 ) {
@@ -190,57 +233,83 @@ async fn run(
             && let Some(req) = queue.pop_front()
         {
             send_positions(&queue, &events, 0);
-            let messages = vec![Message {
-                role: Role::User,
-                content: req.prompt,
-            }];
-            let _ = events.send(Event::Started { request_id: req.id });
-            active = Some(Active {
-                id: req.id,
-                owner: req.owner,
-                reply: String::new(),
-                stream: llm.stream_chat(messages),
-            })
+
+            match db::context_messages(
+                &pool,
+                db::CONVERSATION_ID,
+                req.user_message_id,
+                HISTORY_FETCH_LIMIT,
+            )
+            .await
+            {
+                Ok(history) => {
+                    let messages = chat::build_context(history, prompt_char_budget);
+                    tracing::info!(
+                        request_id = %req.id, context_messages = messages.len(), "generation started"
+                    );
+                    tracing::debug!(?messages, "context sent to model");
+                    let _ = events.send(Event::Started { request_id: req.id });
+                    active = Some(Active {
+                        id: req.id,
+                        owner: req.owner,
+                        reply: String::new(),
+                        stream: llm.stream_chat(messages),
+                    });
+                }
+                Err(e) => {
+                    tracing::error!(request_id = %req.id, error = %e, "could not load history");
+                    let _ = events.send(Event::Failed {
+                        request_id: req.id,
+                        reason: "could not load conversation history".into(),
+                    });
+                    continue;
+                }
+            }
         }
 
         tokio::select! {
             command = commands.recv() => match command {
                 Some(Command::Submit { request_id, owner, author, prompt }) => {
-                    if let Err(e) = db::insert_message(
+                    let user_message_id = match db::insert_message(
                         &pool, db::CONVERSATION_ID, Role::User, Some(&author), &prompt,
+                        db::Status::Complete,
                     ).await {
-                        tracing::error!(%request_id, error = %e, "could not save user message");
-                        let _ = events.send(Event::Failed {
-                            request_id,
-                            reason: "could not save message".into(),
-                        });
-                        continue;
-                    }
+                        Ok(id) => id,
+                        Err(e) => {
+                            tracing::error!(%request_id, error = %e, "could not save user message");
+                            let _ = events.send(Event::Failed {
+                                request_id,
+                                reason: "could not save message".into(),
+                            });
+                            continue;
+                        }
+                    };
 
-                    let _ = events.send(Event::UserMessage {
-                        request_id,
-                        author,
-                        content: prompt.clone(),
-                    });
+                    let _ = events.send(Event::UserMessage { request_id, author, content: prompt });
 
                     let position = queue.len();
-                    queue.push_back(Request { id: request_id, owner, prompt });
+                    queue.push_back(Request { id: request_id, owner, user_message_id });
                     tracing::info!(%request_id, %owner, position, "request queued");
                     let _ = events.send(Event::Queued { request_id, position });
                 }
+
                 Some(Command::Cancel { request_id, requester }) => {
-                    let n = cancel_where(&mut queue, &mut active, &events, |id, owner| {
+                    let result = cancel_where(&mut queue, &mut active, &events, |id, owner| {
                         id == request_id && owner == requester
                     });
-                    if n == 0 {
-                        tracing::info!(%request_id, %requester, "cancel matched nothing");
+                    if result.count == 0 {
+                        tracing::warn!(%request_id, %requester, "cancel matched nothing");
                     }
+                    save_partial(&pool, result.partial, db::Status::Cancelled).await;
                 }
+
                 Some(Command::Disconnect { owner: gone }) => {
-                    let n = cancel_where(&mut queue, &mut active, &events, |_, owner| owner == gone);
-                    tracing::debug!(owner = %gone, cancelled = n, "connection cleaned up");
+                    let result = cancel_where(&mut queue, &mut active, &events, |_, owner| owner == gone);
+                    tracing::debug!(owner = %gone, cancelled = result.count, "connection cleaned up");
+                    save_partial(&pool, result.partial, db::Status::Cancelled).await;
                 }
-                None => break
+
+                None => break,
             },
 
             item = next_token(&mut active) => {
@@ -256,13 +325,19 @@ async fn run(
                     Some(Err(e)) => {
                         tracing::error!(request_id = %id, error = %e, "generation failed");
                         let _ = events.send(Event::Failed { request_id: id, reason: e.to_string() });
-                        active=None;
+                        let partial = (!a.reply.is_empty()).then(|| PartialReply {
+                            request_id: id,
+                            text: std::mem::take(&mut a.reply),
+                        });
+                        active = None;
+                        save_partial(&pool, partial, db::Status::Failed).await;
                     }
                     None => {
                         let reply = std::mem::take(&mut a.reply);
                         active = None;
                         if let Err(e) = db::insert_message(
                             &pool, db::CONVERSATION_ID, Role::Assistant, None, &reply,
+                            db::Status::Complete,
                         ).await {
                             tracing::error!(request_id = %id, error = %e, "could not save reply");
                         }

@@ -1,6 +1,8 @@
+mod chat;
 mod config;
 mod db;
 mod llm;
+mod names;
 mod scheduler;
 
 use axum::{
@@ -55,8 +57,7 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
 
 async fn handle_socket(socket: WebSocket, state: AppState) {
     let connection_id = Uuid::new_v4();
-    // TODO: Name generator
-    let author = format!("user-{}", &connection_id.simple().to_string()[..6]);
+    let author = names::generate_name();
     let span = tracing::info_span!("connection", %connection_id, %author);
 
     async {
@@ -131,7 +132,11 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(llama_url = %config.llama_url, bind = %config.bind_addr, "starting");
 
     let pool = db::connect(&config.database_url).await?;
-    let scheduler = scheduler::spawn(LlmClient::new(&config.llama_url), pool.clone());
+    let scheduler = scheduler::spawn(
+        LlmClient::new(&config.llama_url),
+        pool.clone(),
+        config.prompt_char_budget,
+    );
     let state = AppState { scheduler, pool };
 
     let app = Router::new()

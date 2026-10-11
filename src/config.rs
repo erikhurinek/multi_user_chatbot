@@ -6,6 +6,7 @@ pub struct Config {
     pub llama_url: String,
     pub bind_addr: SocketAddr,
     pub database_url: String,
+    pub prompt_char_budget: usize,
 }
 
 impl Config {
@@ -15,11 +16,15 @@ impl Config {
             .parse()
             .context("BIND_ADDR must look like 127.0.0.1:3000")?;
         let database_url = var_or("DATABASE_URL", "sqlite://chat.db");
+        let prompt_char_budget = var_or("PROMPT_CHAR_BUDGET", "6000")
+            .parse()
+            .context("PROMPT_CHAR_BUDGET must be a whole number")?;
 
         Ok(Self {
             llama_url,
             bind_addr,
             database_url,
+            prompt_char_budget,
         })
     }
 }
