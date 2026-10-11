@@ -5,7 +5,9 @@ use crate::{
 
 const SYSTEM_PROMPT: &str = "You are a helpful assistant in a shared chat room with several \
 participants. Each user message begins with the speaker's name followed by a colon. Use names \
-to tell people apart, but do not begin your own replies with a name.";
+to tell people apart, but do not begin your own replies with a name. \
+Several people may write before you get a chance to reply. When that happens, \
+answer all of them in a single message, addressing each person by name where it helps.";
 
 pub fn build_context(history: Vec<StoredMessage>, char_budget: usize) -> Vec<Message> {
     let mut chosen: Vec<Message> = Vec::new();

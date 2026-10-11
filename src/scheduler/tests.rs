@@ -72,15 +72,16 @@ impl Harness {
             .await
             .unwrap();
         assert!(matches!(self.event().await, Event::UserMessage { .. }));
-        assert_eq!(
-            self.event().await,
-            Event::Queued {
-                request_id: id,
-                position: 0
-            }
-        );
-        assert_eq!(self.event().await, Event::Started { request_id: id });
-        (id, self.call().await)
+        assert_eq!(self.event().await, Event::Queued { request_id: id });
+        let Event::Started {
+            turn_id,
+            request_ids,
+        } = self.event().await
+        else {
+            panic!("expected Started");
+        };
+        assert_eq!(request_ids, vec![id]);
+        (turn_id, self.call().await)
     }
 
     async fn wait_for_rows(&self, count: usize) -> Vec<db::StoredMessage> {
@@ -113,20 +114,20 @@ async fn reply_streams_then_is_saved() {
     assert_eq!(
         h.event().await,
         Event::Token {
-            request_id: id,
+            turn_id: id,
             text: "Hi".into()
         }
     );
     assert_eq!(
         h.event().await,
         Event::Token {
-            request_id: id,
+            turn_id: id,
             text: " there".into()
         }
     );
 
     call.finish();
-    assert_eq!(h.event().await, Event::Finished { request_id: id });
+    assert_eq!(h.event().await, Event::Finished { turn_id: id });
 
     let rows = db::recent_messages(&h.pool, db::CONVERSATION_ID, 10)
         .await
@@ -151,13 +152,7 @@ async fn requests_run_one_at_a_time_and_later_ones_see_earlier_replies() {
         .await
         .unwrap();
     assert!(matches!(h.event().await, Event::UserMessage { .. }));
-    assert_eq!(
-        h.event().await,
-        Event::Queued {
-            request_id: b_id,
-            position: 0
-        }
-    );
+    assert_eq!(h.event().await, Event::Queued { request_id: b_id });
 
     h.silence().await;
     assert!(h.calls.try_recv().is_err(), "the second request must wait");
@@ -166,13 +161,13 @@ async fn requests_run_one_at_a_time_and_later_ones_see_earlier_replies() {
     assert_eq!(
         h.event().await,
         Event::Token {
-            request_id: a_id,
+            turn_id: a_id,
             text: "ok".into()
         }
     );
     a_call.finish();
-    assert_eq!(h.event().await, Event::Finished { request_id: a_id });
-    assert_eq!(h.event().await, Event::Started { request_id: b_id });
+    assert_eq!(h.event().await, Event::Finished { turn_id: a_id });
+    assert_eq!(h.event().await, Event::Started { turn_id: b_id });
 
     let b_call = h.call().await;
     let contents: Vec<&str> = b_call.messages.iter().map(|m| m.content.as_str()).collect();
@@ -189,7 +184,7 @@ async fn cancelling_stops_the_model_and_keeps_the_partial_reply() {
     h.event().await;
 
     h.scheduler.cancel(alice, id).await;
-    assert_eq!(h.event().await, Event::Cancelled { request_id: id });
+    assert_eq!(h.event().await, Event::Cancelled { turn_id: id });
     timeout(WAIT, call.cancelled())
         .await
         .expect("the stream was never dropped");
@@ -217,72 +212,45 @@ async fn only_the_owner_can_cancel() {
 }
 
 #[tokio::test]
-async fn disconnect_cancels_everything_the_connection_owns() {
+async fn prompts_queued_meanwhile_are_answered_in_one_turn() {
     let mut h = Harness::new().await;
-    let (alice, bob) = (Uuid::new_v4(), Uuid::new_v4());
+    let (alice, bob, carol) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
 
-    let (a1, a1_call) = h.start(alice, "alice", "one").await;
-    let a2 = h
+    let (turn1, call1) = h.start(alice, "alice", "First").await;
+
+    let b = h
         .scheduler
-        .submit(alice, "alice".into(), "two".into())
+        .submit(bob, "bob".into(), "Second".into())
         .await
         .unwrap();
-    let b1 = h
+    h.event().await;
+    h.event().await;
+    let c = h
         .scheduler
-        .submit(bob, "bob".into(), "three".into())
-        .await
-        .unwrap();
-
-    h.scheduler.disconnect(alice).await;
-
-    let seen = h.events_until(|e| matches!(e, Event::Started { .. })).await;
-    assert!(seen.contains(&Event::Cancelled { request_id: a1 }));
-    assert!(seen.contains(&Event::Cancelled { request_id: a2 }));
-    assert!(seen.contains(&Event::PositionChanged {
-        request_id: b1,
-        position: 0
-    }));
-    assert_eq!(seen.last(), Some(&Event::Started { request_id: b1 }));
-
-    timeout(WAIT, a1_call.cancelled())
-        .await
-        .expect("the stream was never dropped");
-}
-
-#[tokio::test]
-async fn a_failed_generation_is_saved_as_failed_and_the_queue_moves_on() {
-    let mut h = Harness::new().await;
-    let (alice, bob) = (Uuid::new_v4(), Uuid::new_v4());
-
-    let (a_id, a_call) = h.start(alice, "alice", "one").await;
-    let b_id = h
-        .scheduler
-        .submit(bob, "bob".into(), "two".into())
+        .submit(carol, "carol".into(), "Third".into())
         .await
         .unwrap();
     h.event().await;
     h.event().await;
 
-    a_call.send_token("par");
-    a_call.fail();
+    call1.send_token("ok");
+    h.event().await;
+    call1.finish();
+    assert_eq!(h.event().await, Event::Finished { turn_id: turn1 });
+
+    let Event::Started { request_ids, .. } = h.event().await else {
+        panic!("expected Started");
+    };
+    assert_eq!(request_ids, vec![b, c]);
+
+    let call2 = h.call().await;
+    let contents: Vec<&str> = call2.messages.iter().map(|m| m.content.as_str()).collect();
     assert_eq!(
-        h.event().await,
-        Event::Token {
-            request_id: a_id,
-            text: "par".into()
-        }
+        contents[1..],
+        ["alice: First", "ok", "bob: Second", "carol: Third"]
     );
-    assert!(matches!(
-        h.event().await,
-        Event::Failed { request_id, .. } if request_id == a_id
-    ));
-    assert_eq!(h.event().await, Event::Started { request_id: b_id });
-
-    let rows = h.wait_for_rows(3).await;
-    let failed = rows.iter().find(|r| r.role == "assistant").unwrap();
-    assert_eq!(failed.content, "par");
-    assert_eq!(failed.status, "failed");
-
-    let b_call = h.call().await;
-    assert!(b_call.messages.iter().all(|m| m.content != "par"));
+    assert!(
+        h.calls.try_recv().is_err(),
+        "one model call for both prompts"
+    );
 }

@@ -99,18 +99,17 @@ pub async fn recent_messages(
 pub async fn context_messages(
     pool: &SqlitePool,
     conversation_id: i64,
-    current_id: i64,
+    first_prompt_id: i64,
     limit: i64,
 ) -> Result<Vec<StoredMessage>, sqlx::Error> {
     let mut rows = sqlx::query_as::<_, StoredMessage>(
         "SELECT id, role, author, content, status, created_at FROM messages \
          WHERE conversation_id = ? AND status = 'complete' \
-           AND id != ? AND (role != 'user' OR id < ?) \
+           AND (role != 'user' OR id < ?) \
          ORDER BY id DESC LIMIT ?",
     )
     .bind(conversation_id)
-    .bind(current_id)
-    .bind(current_id)
+    .bind(first_prompt_id)
     .bind(limit)
     .fetch_all(pool)
     .await?;

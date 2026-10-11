@@ -11,6 +11,7 @@ use crate::db;
 use crate::llm::{ChatBackend, LlmClient, LlmError, Message, Role};
 
 const HISTORY_FETCH_LIMIT: i64 = 100;
+const MAX_BATCH: usize = 8;
 
 pub enum Command {
     Submit {
@@ -20,7 +21,7 @@ pub enum Command {
         prompt: String,
     },
     Cancel {
-        request_id: Uuid,
+        id: Uuid,
         requester: Uuid,
     },
     Disconnect {
@@ -31,35 +32,38 @@ pub enum Command {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
-    Queued {
-        request_id: Uuid,
-        position: usize,
-    },
-    PositionChanged {
-        request_id: Uuid,
-        position: usize,
-    },
-    Started {
-        request_id: Uuid,
-    },
-    Token {
-        request_id: Uuid,
-        text: String,
-    },
-    Finished {
-        request_id: Uuid,
-    },
-    Cancelled {
-        request_id: Uuid,
-    },
-    Failed {
-        request_id: Uuid,
-        reason: String,
-    },
     UserMessage {
         request_id: Uuid,
         author: String,
         content: String,
+    },
+    Queued {
+        request_id: Uuid,
+    },
+    Withdrawn {
+        request_id: Uuid,
+    },
+    Rejected {
+        request_id: Uuid,
+        reason: String,
+    },
+    Started {
+        turn_id: Uuid,
+        request_ids: Vec<Uuid>,
+    },
+    Token {
+        turn_id: Uuid,
+        text: String,
+    },
+    Finished {
+        turn_id: Uuid,
+    },
+    Cancelled {
+        turn_id: Uuid,
+    },
+    Failed {
+        turn_id: Uuid,
+        reason: String,
     },
 }
 
@@ -84,11 +88,11 @@ impl SchedulerHandle {
         Some(request_id)
     }
 
-    pub async fn cancel(&self, requester: Uuid, request_id: Uuid) {
+    pub async fn cancel(&self, requester: Uuid, turn_id: Uuid) {
         let _ = self
             .commands
             .send(Command::Cancel {
-                request_id,
+                id: turn_id,
                 requester,
             })
             .await;
@@ -104,13 +108,8 @@ impl SchedulerHandle {
 }
 
 struct PartialReply {
-    request_id: Uuid,
+    turn_id: Uuid,
     text: String,
-}
-
-struct Cancellation {
-    count: usize,
-    partial: Option<PartialReply>,
 }
 
 struct Request {
@@ -121,9 +120,18 @@ struct Request {
 
 struct Active {
     id: Uuid,
-    owner: Uuid,
+    owners: Vec<Uuid>,
     reply: String,
     stream: BoxStream<'static, Result<String, LlmError>>,
+}
+
+impl Active {
+    fn into_partial(self) -> Option<PartialReply> {
+        (!self.reply.is_empty()).then(|| PartialReply {
+            turn_id: self.id,
+            text: self.reply,
+        })
+    }
 }
 
 pub fn spawn<B: ChatBackend>(
@@ -155,48 +163,6 @@ async fn next_token(active: &mut Option<Active>) -> Option<Result<String, LlmErr
     }
 }
 
-fn cancel_where(
-    queue: &mut VecDeque<Request>,
-    active: &mut Option<Active>,
-    events: &broadcast::Sender<Event>,
-    matches: impl Fn(Uuid, Uuid) -> bool,
-) -> Cancellation {
-    let mut count = 0;
-    let mut index = 0;
-    let mut first_removed: Option<usize> = None;
-
-    queue.retain(|r| {
-        let i = index;
-        index += 1;
-
-        let hit = matches(r.id, r.owner);
-        if hit {
-            first_removed.get_or_insert(i);
-            count += 1;
-            let _ = events.send(Event::Cancelled { request_id: r.id });
-        }
-        !hit
-    });
-
-    if let Some(from) = first_removed {
-        send_positions(queue, events, from);
-    }
-
-    let mut partial = None;
-    if let Some(a) = active.take_if(|a| matches(a.id, a.owner)) {
-        count += 1;
-        let _ = events.send(Event::Cancelled { request_id: a.id });
-        if !a.reply.is_empty() {
-            partial = Some(PartialReply {
-                request_id: a.id,
-                text: a.reply,
-            })
-        }
-    }
-
-    Cancellation { count, partial }
-}
-
 async fn save_partial(pool: &SqlitePool, partial: Option<PartialReply>, status: db::Status) {
     let Some(p) = partial else { return };
     if let Err(e) = db::insert_message(
@@ -209,17 +175,31 @@ async fn save_partial(pool: &SqlitePool, partial: Option<PartialReply>, status: 
     )
     .await
     {
-        tracing::error!(request_id = %p.request_id, error = %e, "could not save partial reply");
+        tracing::error!(request_id = %p.turn_id, error = %e, "could not save partial reply");
     }
 }
 
-fn send_positions(queue: &VecDeque<Request>, events: &broadcast::Sender<Event>, from: usize) {
-    for (position, req) in queue.iter().enumerate().skip(from) {
-        let _ = events.send(Event::PositionChanged {
-            request_id: req.id,
-            position,
-        });
-    }
+fn withdraw_where(
+    queue: &mut VecDeque<Request>,
+    events: &broadcast::Sender<Event>,
+    matches: impl Fn(&Request) -> bool,
+) -> usize {
+    let mut count = 0;
+    queue.retain(|r| {
+        let hit = matches(r);
+        if hit {
+            count += 1;
+            let _ = events.send(Event::Withdrawn { request_id: r.id });
+        }
+        !hit
+    });
+    count
+}
+
+async fn stop_turn(pool: &SqlitePool, events: &broadcast::Sender<Event>, turn: Active) {
+    let turn_id = turn.id;
+    save_partial(pool, turn.into_partial(), db::Status::Cancelled).await;
+    let _ = events.send(Event::Cancelled { turn_id });
 }
 
 async fn run<B: ChatBackend>(
@@ -233,45 +213,46 @@ async fn run<B: ChatBackend>(
     let mut active: Option<Active> = None;
 
     loop {
-        if active.is_none()
-            && let Some(req) = queue.pop_front()
-        {
-            send_positions(&queue, &events, 0);
+        if active.is_none() && !queue.is_empty() {
+            let take = queue.len().min(MAX_BATCH);
+            let batch: Vec<Request> = queue.drain(..take).collect();
+            let first_id = batch[0].user_message_id;
 
             let loaded = async {
-                let mut history = db::context_messages(
-                    &pool,
-                    db::CONVERSATION_ID,
-                    req.user_message_id,
-                    HISTORY_FETCH_LIMIT,
-                )
-                .await?;
-                history.push(db::get_message(&pool, req.user_message_id).await?);
+                let mut history =
+                    db::context_messages(&pool, db::CONVERSATION_ID, first_id, HISTORY_FETCH_LIMIT)
+                        .await?;
+                for r in &batch {
+                    history.push(db::get_message(&pool, r.user_message_id).await?);
+                }
                 Ok::<_, sqlx::Error>(history)
             }
             .await;
 
             match loaded {
                 Ok(history) => {
+                    let turn_id = Uuid::new_v4();
                     let messages = chat::build_context(history, prompt_char_budget);
-                    tracing::info!(
-                        request_id = %req.id, context_messages = messages.len(), "generation started"
-                    );
-                    tracing::debug!(?messages, "context sent to model");
-                    let _ = events.send(Event::Started { request_id: req.id });
+                    tracing::info!(%turn_id, prompts = batch.len(), "generation started");
+                    let _ = events.send(Event::Started {
+                        turn_id,
+                        request_ids: batch.iter().map(|r| r.id).collect(),
+                    });
                     active = Some(Active {
-                        id: req.id,
-                        owner: req.owner,
+                        id: turn_id,
+                        owners: batch.iter().map(|r| r.owner).collect(),
                         reply: String::new(),
                         stream: backend.stream_chat(messages),
                     });
                 }
                 Err(e) => {
-                    tracing::error!(request_id = %req.id, error = %e, "could not load history");
-                    let _ = events.send(Event::Failed {
-                        request_id: req.id,
-                        reason: "could not load conversation history".into(),
-                    });
+                    tracing::error!(error = %e, "could not load history");
+                    for r in &batch {
+                        let _ = events.send(Event::Rejected {
+                            request_id: r.id,
+                            reason: "could not load conversation history".into(),
+                        });
+                    }
                     continue;
                 }
             }
@@ -281,42 +262,41 @@ async fn run<B: ChatBackend>(
             command = commands.recv() => match command {
                 Some(Command::Submit { request_id, owner, author, prompt }) => {
                     let user_message_id = match db::insert_message(
-                        &pool, db::CONVERSATION_ID, Role::User, Some(&author), &prompt,
-                        db::Status::Complete,
+                        &pool, db::CONVERSATION_ID, Role::User, Some(&author), &prompt, db::Status::Complete,
                     ).await {
                         Ok(id) => id,
                         Err(e) => {
                             tracing::error!(%request_id, error = %e, "could not save user message");
-                            let _ = events.send(Event::Failed {
-                                request_id,
-                                reason: "could not save message".into(),
-                            });
+                            let _ = events.send(Event::Rejected { request_id, reason: "could not save message".into() });
                             continue;
                         }
                     };
-
                     let _ = events.send(Event::UserMessage { request_id, author, content: prompt });
-
-                    let position = queue.len();
                     queue.push_back(Request { id: request_id, owner, user_message_id });
-                    tracing::info!(%request_id, %owner, position, "request queued");
-                    let _ = events.send(Event::Queued { request_id, position });
+                    tracing::info!(%request_id, %owner, "request queued");
+                    let _ = events.send(Event::Queued { request_id });
                 }
 
-                Some(Command::Cancel { request_id, requester }) => {
-                    let result = cancel_where(&mut queue, &mut active, &events, |id, owner| {
-                        id == request_id && owner == requester
-                    });
-                    if result.count == 0 {
-                        tracing::warn!(%request_id, %requester, "cancel matched nothing");
+                Some(Command::Cancel { id, requester }) => {
+                    let mut count = withdraw_where(&mut queue, &events, |r| r.id == id && r.owner == requester);
+                    if let Some(turn) = active.take_if(|a| a.id == id && a.owners.contains(&requester)) {
+                        count += 1;
+                        stop_turn(&pool, &events, turn).await;
                     }
-                    save_partial(&pool, result.partial, db::Status::Cancelled).await;
+                    if count == 0 {
+                        tracing::warn!(%id, %requester, "cancel matched nothing");
+                    }
                 }
 
                 Some(Command::Disconnect { owner: gone }) => {
-                    let result = cancel_where(&mut queue, &mut active, &events, |_, owner| owner == gone);
-                    tracing::debug!(owner = %gone, cancelled = result.count, "connection cleaned up");
-                    save_partial(&pool, result.partial, db::Status::Cancelled).await;
+                    let withdrawn = withdraw_where(&mut queue, &events, |r| r.owner == gone);
+                    if let Some(a) = active.as_mut() {
+                        a.owners.retain(|o| *o != gone);
+                    }
+                    if let Some(turn) = active.take_if(|a| a.owners.is_empty()) {
+                        stop_turn(&pool, &events, turn).await;
+                    }
+                    tracing::debug!(owner = %gone, withdrawn, "connection cleaned up");
                 }
 
                 None => break,
@@ -330,13 +310,13 @@ async fn run<B: ChatBackend>(
                     Some(Ok(text)) => {
                         a.reply.push_str(&text);
                         tracing::trace!(%id, "token");
-                        let _ = events.send(Event::Token { request_id: id, text });
+                        let _ = events.send(Event::Token { turn_id: id, text });
                     }
                     Some(Err(e)) => {
                         tracing::error!(request_id = %id, error = %e, "generation failed");
-                        let _ = events.send(Event::Failed { request_id: id, reason: e.to_string() });
+                        let _ = events.send(Event::Failed { turn_id: id, reason: e.to_string() });
                         let partial = (!a.reply.is_empty()).then(|| PartialReply {
-                            request_id: id,
+                            turn_id: id,
                             text: std::mem::take(&mut a.reply),
                         });
                         active = None;
@@ -352,7 +332,7 @@ async fn run<B: ChatBackend>(
                             tracing::error!(request_id = %id, error = %e, "could not save reply");
                         }
                         tracing::info!(request_id = %id, "generation finished");
-                        let _ = events.send(Event::Finished { request_id: id });
+                        let _ = events.send(Event::Finished { turn_id: id });
                     }
                 }
             }
