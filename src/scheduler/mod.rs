@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::chat;
 use crate::db;
-use crate::llm::{LlmClient, LlmError, Message, Role};
+use crate::llm::{ChatBackend, LlmClient, LlmError, Message, Role};
 
 const HISTORY_FETCH_LIMIT: i64 = 100;
 
@@ -28,7 +28,7 @@ pub enum Command {
     },
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
     Queued {
@@ -126,12 +126,16 @@ struct Active {
     stream: BoxStream<'static, Result<String, LlmError>>,
 }
 
-pub fn spawn(llm: LlmClient, pool: SqlitePool, prompt_char_budget: usize) -> SchedulerHandle {
+pub fn spawn<B: ChatBackend>(
+    backend: B,
+    pool: SqlitePool,
+    prompt_char_budget: usize,
+) -> SchedulerHandle {
     let (commands_tx, commands_rx) = mpsc::channel(32);
     let (events_tx, _) = broadcast::channel(256);
 
     tokio::spawn(run(
-        llm,
+        backend,
         pool,
         prompt_char_budget,
         commands_rx,
@@ -218,8 +222,8 @@ fn send_positions(queue: &VecDeque<Request>, events: &broadcast::Sender<Event>, 
     }
 }
 
-async fn run(
-    llm: LlmClient,
+async fn run<B: ChatBackend>(
+    backend: B,
     pool: SqlitePool,
     prompt_char_budget: usize,
     mut commands: mpsc::Receiver<Command>,
@@ -234,14 +238,20 @@ async fn run(
         {
             send_positions(&queue, &events, 0);
 
-            match db::context_messages(
-                &pool,
-                db::CONVERSATION_ID,
-                req.user_message_id,
-                HISTORY_FETCH_LIMIT,
-            )
-            .await
-            {
+            let loaded = async {
+                let mut history = db::context_messages(
+                    &pool,
+                    db::CONVERSATION_ID,
+                    req.user_message_id,
+                    HISTORY_FETCH_LIMIT,
+                )
+                .await?;
+                history.push(db::get_message(&pool, req.user_message_id).await?);
+                Ok::<_, sqlx::Error>(history)
+            }
+            .await;
+
+            match loaded {
                 Ok(history) => {
                     let messages = chat::build_context(history, prompt_char_budget);
                     tracing::info!(
@@ -253,7 +263,7 @@ async fn run(
                         id: req.id,
                         owner: req.owner,
                         reply: String::new(),
-                        stream: llm.stream_chat(messages),
+                        stream: backend.stream_chat(messages),
                     });
                 }
                 Err(e) => {
@@ -349,3 +359,6 @@ async fn run(
         }
     }
 }
+
+#[cfg(test)]
+pub mod tests;

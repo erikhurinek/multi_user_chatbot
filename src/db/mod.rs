@@ -37,19 +37,23 @@ pub struct StoredMessage {
     pub created_at: String,
 }
 
-pub async fn connect(url: &str) -> anyhow::Result<SqlitePool> {
+pub async fn connect_with(url: &str, max_connections: u32) -> anyhow::Result<SqlitePool> {
     let options = SqliteConnectOptions::from_str(url)?
         .journal_mode(SqliteJournalMode::Wal)
         .create_if_missing(true)
         .foreign_keys(true);
 
     let pool = SqlitePoolOptions::new()
-        .max_connections(5)
+        .max_connections(max_connections)
         .connect_with(options)
         .await?;
 
     sqlx::migrate!().run(&pool).await?;
     Ok(pool)
+}
+
+pub async fn connect(url: &str) -> anyhow::Result<SqlitePool> {
+    connect_with(url, 5).await
 }
 
 pub async fn insert_message(
@@ -95,22 +99,33 @@ pub async fn recent_messages(
 pub async fn context_messages(
     pool: &SqlitePool,
     conversation_id: i64,
-    up_to_id: i64,
+    current_id: i64,
     limit: i64,
 ) -> Result<Vec<StoredMessage>, sqlx::Error> {
     let mut rows = sqlx::query_as::<_, StoredMessage>(
         "SELECT id, role, author, content, status, created_at FROM messages \
-         WHERE conversation_id = ? AND id <= ? AND status = 'complete' \
+         WHERE conversation_id = ? AND status = 'complete' \
+           AND id != ? AND (role != 'user' OR id < ?) \
          ORDER BY id DESC LIMIT ?",
     )
     .bind(conversation_id)
-    .bind(up_to_id)
+    .bind(current_id)
+    .bind(current_id)
     .bind(limit)
     .fetch_all(pool)
     .await?;
 
     rows.reverse();
     Ok(rows)
+}
+
+pub async fn get_message(pool: &SqlitePool, id: i64) -> Result<StoredMessage, sqlx::Error> {
+    sqlx::query_as::<_, StoredMessage>(
+        "SELECT id, role, author, content, status, created_at FROM messages WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
 }
 
 #[cfg(test)]

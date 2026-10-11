@@ -1,6 +1,7 @@
 use async_stream::try_stream;
 use futures_util::{StreamExt, stream::BoxStream};
 
+use super::backend::ChatBackend;
 use super::error::LlmError;
 use super::sse::{LineBuffer, SseEvent, parse_line};
 use super::types::{ChatRequest, Message, StreamChunk};
@@ -18,11 +19,10 @@ impl LlmClient {
             chat_url: format!("{}/v1/chat/completions", base_url.trim_end_matches('/')),
         }
     }
+}
 
-    pub fn stream_chat(
-        &self,
-        messages: Vec<Message>,
-    ) -> BoxStream<'static, Result<String, LlmError>> {
+impl ChatBackend for LlmClient {
+    fn stream_chat(&self, messages: Vec<Message>) -> BoxStream<'static, Result<String, LlmError>> {
         let http = self.http.clone();
         let url = self.chat_url.clone();
 
