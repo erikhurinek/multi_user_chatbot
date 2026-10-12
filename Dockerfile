@@ -4,8 +4,6 @@ WORKDIR /frontend
 COPY frontend/package.json frontend/bun.lock* ./
 RUN bun install --frozen-lockfile
 COPY frontend/ ./
-ARG VITE_BASE_PATH=/
-ENV VITE_BASE_PATH=$VITE_BASE_PATH
 RUN bun run build
 
 # ---- Stage 2: build the backend ----
@@ -30,7 +28,7 @@ RUN touch src/main.rs && cargo build --release
 # ---- Stage 3: the runtime image ----
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
+    && apt-get install -y --no-install-recommends curl sqlite3 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --create-home --uid 10001 app \
     && mkdir /data && chown app:app /data
