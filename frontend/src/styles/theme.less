@@ -1,0 +1,55 @@
+// Light theme
+.theme-light() {
+  --page-from: @{gradient-light-from};
+  --page-to: @{gradient-light-to};
+  --surface: @{white};
+  --surface-alt: @{paper-100};
+  --canvas: @{paper-50};
+  --border: @{paper-300};
+  --text: @{ink-800};
+  --text-muted: @{ink-600};
+  --input-bg: @{white};
+  --input-border: @{paper-400};
+  --own-bg: @{blue-600};
+  --own-bg-hover: @{blue-700};
+  --own-text: @{white};
+  --other-bg: @{sky-100};
+  --other-text: @{ink-900};
+  --ai-bg: @{paper-200};
+  --ai-text: @{ink-900};
+  --busy: @{red-700};
+  --shadow: rgba(0, 0, 0, 0.1);
+}
+
+// Dark theme
+.theme-dark() {
+  --page-from: @{night-950};
+  --page-to: @{gradient-dark-to};
+  --surface: @{night-850};
+  --surface-alt: @{night-800};
+  --canvas: @{night-900};
+  --border: @{night-600};
+  --text: @{mist-100};
+  --text-muted: @{mist-400};
+  --input-bg: @{night-900};
+  --input-border: @{night-500};
+  --own-bg: @{blue-500};
+  --own-bg-hover: @{blue-450};
+  --own-text: @{white};
+  --other-bg: @{navy-700};
+  --other-text: @{mist-200};
+  --ai-bg: @{night-700};
+  --ai-text: @{mist-100};
+  --busy: @{red-400};
+  --shadow: rgba(0, 0, 0, 0.5);
+}
+
+:root {
+  .theme-light();
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    .theme-dark();
+  }
+}

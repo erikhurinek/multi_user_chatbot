@@ -1,5 +1,6 @@
 use sqlx::SqlitePool;
 use std::collections::VecDeque;
+use tokio::sync::oneshot;
 
 use futures_util::{StreamExt, stream::BoxStream};
 use serde::Serialize;
@@ -8,9 +9,10 @@ use uuid::Uuid;
 
 use crate::chat;
 use crate::db;
-use crate::llm::{ChatBackend, LlmClient, LlmError, Message, Role};
+use crate::db::StoredMessage;
+use crate::llm::{ChatBackend, LlmError, Role};
 
-const HISTORY_FETCH_LIMIT: i64 = 100;
+const HISTORY_LIMIT: i64 = 50;
 const MAX_BATCH: usize = 8;
 
 pub enum Command {
@@ -27,6 +29,9 @@ pub enum Command {
     Disconnect {
         owner: Uuid,
     },
+    Join {
+        reply: oneshot::Sender<Joined>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -34,6 +39,7 @@ pub enum Command {
 pub enum Event {
     UserMessage {
         request_id: Uuid,
+        message_id: i64,
         author: String,
         content: String,
     },
@@ -67,6 +73,31 @@ pub enum Event {
     },
 }
 
+#[derive(Serialize)]
+pub struct Pending {
+    pub request_id: Uuid,
+    pub message_id: i64,
+    pub turn_id: Option<Uuid>,
+}
+
+#[derive(Serialize)]
+pub struct RunningTurn {
+    pub turn_id: Uuid,
+    pub reply: String,
+}
+
+#[derive(Serialize)]
+pub struct Snapshot {
+    pub messages: Vec<StoredMessage>,
+    pub pending: Vec<Pending>,
+    pub turn: Option<RunningTurn>,
+}
+
+pub struct Joined {
+    pub events: broadcast::Receiver<Event>,
+    pub snapshot: Snapshot,
+}
+
 #[derive(Clone)]
 pub struct SchedulerHandle {
     commands: mpsc::Sender<Command>,
@@ -74,6 +105,12 @@ pub struct SchedulerHandle {
 }
 
 impl SchedulerHandle {
+    pub async fn join(&self) -> Option<Joined> {
+        let (reply, answer) = oneshot::channel();
+        self.commands.send(Command::Join { reply }).await.ok()?;
+        answer.await.ok()
+    }
+
     pub async fn submit(&self, owner: Uuid, author: String, prompt: String) -> Option<Uuid> {
         let request_id = Uuid::new_v4();
         self.commands
@@ -101,15 +138,16 @@ impl SchedulerHandle {
     pub async fn disconnect(&self, owner: Uuid) {
         let _ = self.commands.send(Command::Disconnect { owner }).await;
     }
-
-    pub fn subscribe(&self) -> broadcast::Receiver<Event> {
-        self.events.subscribe()
-    }
 }
 
 struct PartialReply {
     turn_id: Uuid,
     text: String,
+}
+
+struct PromptRef {
+    request_id: Uuid,
+    message_id: i64,
 }
 
 struct Request {
@@ -121,6 +159,7 @@ struct Request {
 struct Active {
     id: Uuid,
     owners: Vec<Uuid>,
+    prompts: Vec<PromptRef>,
     reply: String,
     stream: BoxStream<'static, Result<String, LlmError>>,
 }
@@ -220,7 +259,7 @@ async fn run<B: ChatBackend>(
 
             let loaded = async {
                 let mut history =
-                    db::context_messages(&pool, db::CONVERSATION_ID, first_id, HISTORY_FETCH_LIMIT)
+                    db::context_messages(&pool, db::CONVERSATION_ID, first_id, HISTORY_LIMIT)
                         .await?;
                 for r in &batch {
                     history.push(db::get_message(&pool, r.user_message_id).await?);
@@ -241,6 +280,13 @@ async fn run<B: ChatBackend>(
                     active = Some(Active {
                         id: turn_id,
                         owners: batch.iter().map(|r| r.owner).collect(),
+                        prompts: batch
+                            .iter()
+                            .map(|r| PromptRef {
+                                request_id: r.id,
+                                message_id: r.user_message_id,
+                            })
+                            .collect(),
                         reply: String::new(),
                         stream: backend.stream_chat(messages),
                     });
@@ -271,7 +317,12 @@ async fn run<B: ChatBackend>(
                             continue;
                         }
                     };
-                    let _ = events.send(Event::UserMessage { request_id, author, content: prompt });
+                    let _ = events.send(Event::UserMessage {
+                        request_id,
+                        message_id: user_message_id,
+                        author,
+                        content: prompt,
+                    });
                     queue.push_back(Request { id: request_id, owner, user_message_id });
                     tracing::info!(%request_id, %owner, "request queued");
                     let _ = events.send(Event::Queued { request_id });
@@ -297,6 +348,31 @@ async fn run<B: ChatBackend>(
                         stop_turn(&pool, &events, turn).await;
                     }
                     tracing::debug!(owner = %gone, withdrawn, "connection cleaned up");
+                }
+
+                Some(Command::Join { reply }) => {
+                    let receiver = events.subscribe();
+
+                    match db::recent_messages(&pool, db::CONVERSATION_ID, HISTORY_LIMIT).await {
+                        Ok(messages) => {
+                            let mut pending: Vec<Pending> = queue
+                                .iter()
+                                .map(|r| Pending { request_id: r.id, message_id: r.user_message_id, turn_id: None })
+                                .collect();
+
+                            let turn = active.as_ref().map(|a| {
+                                pending.extend(a.prompts.iter().map(|p| Pending {
+                                    request_id: p.request_id,
+                                    message_id: p.message_id,
+                                    turn_id: Some(a.id),
+                                }));
+                                RunningTurn { turn_id: a.id, reply: a.reply.clone() }
+                            });
+
+                            let _ = reply.send(Joined { events: receiver, snapshot: Snapshot { messages, pending, turn } });
+                        }
+                        Err(e) => tracing::error!(error = %e, "could not build snapshot"),
+                    }
                 }
 
                 None => break,

@@ -35,13 +35,6 @@ impl FakeCall {
             .expect("the scheduler dropped the stream");
     }
 
-    pub fn fail(&self) {
-        let error = serde_json::from_str::<()>("not json").unwrap_err();
-        self.tx
-            .send(Err(LlmError::Parse(error)))
-            .expect("the scheduler dropped the stream");
-    }
-
     pub fn finish(self) {}
 
     pub fn is_cancelled(&self) -> bool {

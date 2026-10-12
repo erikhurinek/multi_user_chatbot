@@ -47,18 +47,6 @@ impl Harness {
             .expect("fake backend dropped")
     }
 
-    async fn events_until(&mut self, done: impl Fn(&Event) -> bool) -> Vec<Event> {
-        let mut seen = Vec::new();
-        loop {
-            let event = self.event().await;
-            let finished = done(&event);
-            seen.push(event);
-            if finished {
-                return seen;
-            }
-        }
-    }
-
     async fn silence(&mut self) {
         if let Ok(event) = timeout(Duration::from_millis(150), self.events.recv()).await {
             panic!("expected silence, got {event:?}");
@@ -167,7 +155,10 @@ async fn requests_run_one_at_a_time_and_later_ones_see_earlier_replies() {
     );
     a_call.finish();
     assert_eq!(h.event().await, Event::Finished { turn_id: a_id });
-    assert_eq!(h.event().await, Event::Started { turn_id: b_id });
+    let Event::Started { request_ids, .. } = h.event().await else {
+        panic!("expected Started");
+    };
+    assert_eq!(request_ids, vec![b_id]);
 
     let b_call = h.call().await;
     let contents: Vec<&str> = b_call.messages.iter().map(|m| m.content.as_str()).collect();
@@ -252,5 +243,33 @@ async fn prompts_queued_meanwhile_are_answered_in_one_turn() {
     assert!(
         h.calls.try_recv().is_err(),
         "one model call for both prompts"
+    );
+}
+
+#[tokio::test]
+async fn joining_mid_turn_gives_a_consistent_snapshot() {
+    let mut h = Harness::new().await;
+    let alice = Uuid::new_v4();
+    let (turn, call) = h.start(alice, "alice", "Hi").await;
+
+    call.send_token("Hel");
+    h.event().await;
+
+    let mut joined = h.scheduler.join().await.unwrap();
+    let running = joined.snapshot.turn.as_ref().unwrap();
+    assert_eq!(running.turn_id, turn);
+    assert_eq!(running.reply, "Hel");
+    assert_eq!(joined.snapshot.pending.len(), 1);
+    assert_eq!(joined.snapshot.pending[0].turn_id, Some(turn));
+    assert_eq!(joined.snapshot.messages.len(), 1);
+
+    call.send_token("lo");
+    let next = timeout(WAIT, joined.events.recv()).await.unwrap().unwrap();
+    assert_eq!(
+        next,
+        Event::Token {
+            turn_id: turn,
+            text: "lo".into()
+        }
     );
 }

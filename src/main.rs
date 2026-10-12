@@ -17,8 +17,8 @@ use axum::{
 use config::Config;
 use llm::LlmClient;
 use scheduler::SchedulerHandle;
+use scheduler::{Joined, Snapshot};
 use serde::Deserialize;
-use sqlx::SqlitePool;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
@@ -27,13 +27,6 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct AppState {
     scheduler: SchedulerHandle,
-    pool: SqlitePool,
-}
-
-#[derive(serde::Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum Greeting {
-    History { messages: Vec<db::StoredMessage> },
 }
 
 #[derive(Deserialize)]
@@ -41,6 +34,13 @@ enum Greeting {
 enum ClientMessage {
     Submit { prompt: String },
     Cancel { request_id: Uuid },
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Greeting {
+    Welcome { author: String },
+    History(Snapshot),
 }
 
 async fn send_json<T: serde::Serialize>(
@@ -71,18 +71,30 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 }
 
 async fn serve_connection(mut socket: WebSocket, state: &AppState, me: Uuid, author: &str) {
-    let mut events = state.scheduler.subscribe();
+    if send_json(
+        &mut socket,
+        &Greeting::Welcome {
+            author: author.to_owned(),
+        },
+    )
+    .await
+    .is_err()
+    {
+        return;
+    }
 
-    match db::recent_messages(&state.pool, db::CONVERSATION_ID, 50).await {
-        Ok(messages) => {
-            if send_json(&mut socket, &Greeting::History { messages })
-                .await
-                .is_err()
-            {
-                return;
-            }
-        }
-        Err(e) => tracing::error!(error = %e, "could not load history"),
+    let Some(Joined {
+        mut events,
+        snapshot,
+    }) = state.scheduler.join().await
+    else {
+        return;
+    };
+    if send_json(&mut socket, &Greeting::History(snapshot))
+        .await
+        .is_err()
+    {
+        return;
     }
 
     loop {
@@ -137,7 +149,7 @@ async fn main() -> anyhow::Result<()> {
         pool.clone(),
         config.prompt_char_budget,
     );
-    let state = AppState { scheduler, pool };
+    let state = AppState { scheduler };
 
     let app = Router::new()
         .route("/health", get(|| async { "OK" }))

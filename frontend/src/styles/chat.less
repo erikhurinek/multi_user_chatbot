@@ -1,0 +1,328 @@
+@radius-panel: 20px;
+@radius-bubble: 18px;
+@radius-tight: 6px;
+@radius-control: 12px;
+@breakpoint-card: 769px;
+
+.chat {
+  width: 95%;
+  max-width: 1000px;
+  flex: none;
+  height: 92dvh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--surface);
+  border-radius: @radius-panel;
+  box-shadow: 0 12px 24px var(--shadow);
+
+  @media (min-width: @breakpoint-card) {
+    width: 95%;
+    max-width: 1000px;
+    height: 92dvh;
+    border-radius: @radius-panel;
+    box-shadow: 0 12px 24px var(--shadow);
+  }
+
+  &__header {
+    position: relative;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 24px;
+    background: var(--surface-alt);
+    border-bottom: 2px solid var(--border);
+
+    h1 {
+      font-size: 1.75rem;
+      font-weight: 600;
+    }
+  }
+
+  &__status {
+    position: absolute;
+    right: 20px;
+    font-size: 0.85rem;
+
+    &:empty {
+      display: none;
+    }
+  }
+
+  &__messages {
+    flex: 1;
+    min-height: 0;
+    min-width: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    padding: 30px 40px;
+    background: var(--canvas);
+  }
+
+  &__composer {
+    display: flex;
+    gap: 12px;
+    padding: 20px 24px;
+    background: var(--surface-alt);
+    border-top: 2px solid var(--border);
+
+    textarea {
+      flex: 1;
+      max-height: 150px;
+      padding: 14px 18px;
+      border: 1px solid var(--input-border);
+      border-radius: @radius-control;
+      background: var(--input-bg);
+      color: var(--text);
+      font: inherit;
+      resize: none;
+      overflow-y: auto;
+
+      &::placeholder {
+        color: var(--text-muted);
+      }
+
+      &:focus-visible {
+        outline: 2px solid var(--own-bg);
+        outline-offset: 1px;
+      }
+    }
+
+    button {
+      padding: 0 24px;
+      border: 0;
+      border-radius: @radius-control;
+      background: var(--own-bg);
+      color: var(--own-text);
+      font: inherit;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+
+      &:hover:not(:disabled) {
+        background: var(--own-bg-hover);
+      }
+
+      &:focus-visible {
+        outline: 2px solid var(--text);
+        outline-offset: 2px;
+      }
+
+      &:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+    }
+  }
+}
+
+// Status pills (top right)
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  color: var(--text-muted);
+
+  &--warn {
+    color: var(--busy);
+  }
+
+  &--busy {
+    color: var(--busy);
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: currentColor;
+      animation: pulse 1.5s infinite;
+    }
+  }
+}
+
+// A run of messages from one speaker
+.group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 70%;
+  animation: fade-in 0.3s ease-in-out;
+
+  &__name {
+    padding: 0 6px;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+  }
+
+  // Every human, including you: right-aligned
+  &--own,
+  &--other {
+    align-self: flex-end;
+    align-items: flex-end;
+
+    .group__name {
+      text-align: right;
+    }
+
+    .bubble {
+      &:not(:first-of-type) {
+        border-top-right-radius: @radius-tight;
+      }
+
+      &:not(:last-of-type) {
+        border-bottom-right-radius: @radius-tight;
+      }
+    }
+  }
+
+  // Colour is the only thing that distinguishes you from other people
+  &--own .bubble {
+    background: var(--own-bg);
+    color: var(--own-text);
+  }
+
+  &--other .bubble {
+    background: var(--other-bg);
+    color: var(--other-text);
+  }
+
+  // The assistant: left-aligned
+  &--assistant {
+    align-self: flex-start;
+    align-items: flex-start;
+
+    .bubble {
+      background: var(--ai-bg);
+      color: var(--ai-text);
+
+      &:not(:first-of-type) {
+        border-top-left-radius: @radius-tight;
+      }
+
+      &:not(:last-of-type) {
+        border-bottom-left-radius: @radius-tight;
+      }
+    }
+  }
+}
+
+.bubble {
+  width: fit-content;
+  padding: 14px 20px;
+  border-radius: @radius-bubble;
+  font-size: 1rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+
+  &.is-queued,
+  &.is-dropped {
+    opacity: 0.6;
+  }
+
+  &__note {
+    display: block;
+    margin-top: 4px;
+    font-size: 0.75rem;
+    opacity: 0.8;
+  }
+}
+
+// Three pulsing dots while the model is still reading the prompt
+.typing {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 1.45em;
+
+  span {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    animation: pulse 1.2s infinite;
+
+    &:nth-child(2) {
+      animation-delay: 0.2s;
+    }
+
+    &:nth-child(3) {
+      animation-delay: 0.4s;
+    }
+  }
+}
+
+// @media (max-width: 768px) {
+//   .chat {
+//     &__header {
+//       padding: 18px;
+//
+//       h1 {
+//         font-size: 1.5rem;
+//       }
+//     }
+//
+//     &__status {
+//       right: 15px;
+//       font-size: 0.75rem;
+//     }
+//
+//     &__messages {
+//       padding: 20px 25px;
+//     }
+//
+//     &__composer {
+//       padding: 15px;
+//       gap: 8px;
+//     }
+//   }
+//
+//   .group {
+//     max-width: 85%;
+//   }
+//
+//   .bubble {
+//     padding: 12px 16px;
+//     font-size: 0.95rem;
+//   }
+// }
+
+// @media (max-width: 480px) {
+//   .chat {
+//     &__header {
+//       flex-direction: column;
+//       gap: 8px;
+//       padding: 14px;
+//
+//       h1 {
+//         font-size: 1.3rem;
+//       }
+//     }
+//
+//     &__status {
+//       position: static;
+//       font-size: 0.7rem;
+//     }
+//
+//     &__messages {
+//       padding: 15px 20px;
+//       gap: 12px;
+//     }
+//
+//     &__composer {
+//       padding: 12px 12px calc(12px + env(safe-area-inset-bottom, 0px));
+//     }
+//   }
+//
+//   .group {
+//     max-width: 90%;
+//   }
+//
+//   .bubble {
+//     padding: 10px 14px;
+//     font-size: 0.9rem;
+//   }
+// }
