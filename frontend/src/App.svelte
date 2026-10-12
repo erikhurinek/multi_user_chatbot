@@ -4,7 +4,8 @@
   import { groupItems, type Group } from './lib/group';
 
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
-  const chat = createChat(`${scheme}://${location.host}/ws`);
+  const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+  const chat = createChat(`${scheme}://${location.host}${base}/ws`);
   onDestroy(chat.close);
 
   let draft = $state('');

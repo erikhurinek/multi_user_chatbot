@@ -4,6 +4,8 @@ WORKDIR /frontend
 COPY frontend/package.json frontend/bun.lock* ./
 RUN bun install --frozen-lockfile
 COPY frontend/ ./
+ARG VITE_BASE_PATH=/
+ENV VITE_BASE_PATH=$VITE_BASE_PATH
 RUN bun run build
 
 # ---- Stage 2: build the backend ----
