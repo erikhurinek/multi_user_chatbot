@@ -141,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let config = Config::from_env()?;
+    let config = Config::load()?;
     tracing::info!(llama_url = %config.llama_url, bind = %config.bind_addr, "starting");
 
     let pool = db::connect(&config.database_url).await?;

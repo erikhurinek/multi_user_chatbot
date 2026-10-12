@@ -1,6 +1,7 @@
-use std::{env, fs, net::SocketAddr};
+use std::{env, fs, io, net::SocketAddr, path::PathBuf};
 
 use anyhow::Context;
+use serde::Deserialize;
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant in a shared chat room \
 with several participants. Each user message begins with the speaker's name followed by a \
@@ -8,66 +9,87 @@ colon. Use names to tell people apart, but do not begin your own replies with a 
 Several people may write before you get a chance to reply. When that happens, answer all of \
 them in a single message, addressing each person by name where it helps.";
 
-fn load_system_prompt() -> anyhow::Result<String> {
-    if let Ok(path) = env::var("SYSTEM_PROMPT_FILE") {
-        let text = fs::read_to_string(&path)
-            .with_context(|| format!("could not read SYSTEM_PROMPT_FILE ({path})"))?;
-        return non_empty(text, "SYSTEM_PROMPT_FILE");
-    }
-    match env::var("SYSTEM_PROMPT") {
-        Ok(text) => non_empty(text, "SYSTEM_PROMPT"),
-        Err(_) => Ok(DEFAULT_SYSTEM_PROMPT.to_owned()),
-    }
-}
-
-fn non_empty(text: String, source: &str) -> anyhow::Result<String> {
-    let text = text.trim().to_owned();
-    anyhow::ensure!(!text.is_empty(), "{source} is set but empty");
-    Ok(text)
-}
-
 pub struct Config {
     pub llama_url: String,
     pub bind_addr: SocketAddr,
     pub database_url: String,
+    pub static_dir: PathBuf,
     pub prompt_char_budget: usize,
-    pub static_dir: std::path::PathBuf,
     pub system_prompt: String,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileConfig {
+    llama_url: Option<String>,
+    bind_addr: Option<String>,
+    database_url: Option<String>,
+    static_dir: Option<PathBuf>,
+    prompt_char_budget: Option<usize>,
+    system_prompt: Option<String>,
+}
+
 impl Config {
-    pub fn from_env() -> anyhow::Result<Self> {
-        let llama_url = var_or("LLAMA_URL", "http://localhost:8080");
-        let bind_addr = var_or("BIND_ADDR", "127.0.0.1:3000")
+    pub fn load() -> anyhow::Result<Self> {
+        Self::resolve(read_file()?, |name| env::var(name).ok())
+    }
+
+    fn resolve(file: FileConfig, env: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
+        let llama_url = env("LLAMA_URL")
+            .or(file.llama_url)
+            .unwrap_or_else(|| "http://localhost:8080".to_owned());
+
+        let bind_addr = env("BIND_ADDR")
+            .or(file.bind_addr)
+            .unwrap_or_else(|| "127.0.0.1:3000".to_owned())
             .parse()
-            .context("BIND_ADDR must look like 127.0.0.1:3000")?;
-        let database_url = var_or("DATABASE_URL", "sqlite://chat.db");
-        let prompt_char_budget = var_or("PROMPT_CHAR_BUDGET", "6000")
-            .parse()
-            .context("PROMPT_CHAR_BUDGET must be a whole number")?;
-        let static_dir = var_or("STATIC_DIR", "./frontend/dist").into();
-        let system_prompt = load_system_prompt()?;
+            .context("bind_addr must look like 127.0.0.1:3000")?;
+
+        let database_url = env("DATABASE_URL")
+            .or(file.database_url)
+            .unwrap_or_else(|| "sqlite://chat.db".to_owned());
+
+        let static_dir = env("STATIC_DIR")
+            .map(PathBuf::from)
+            .or(file.static_dir)
+            .unwrap_or_else(|| PathBuf::from("frontend/dist"));
+
+        let prompt_char_budget = match env("PROMPT_CHAR_BUDGET") {
+            Some(text) => text
+                .parse()
+                .context("PROMPT_CHAR_BUDGET must be a whole number")?,
+            None => file.prompt_char_budget.unwrap_or(6000),
+        };
+
+        let system_prompt = env("SYSTEM_PROMPT")
+            .or(file.system_prompt)
+            .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_owned());
+        let system_prompt = system_prompt.trim().to_owned();
+        anyhow::ensure!(!system_prompt.is_empty(), "system_prompt must not be empty");
 
         Ok(Self {
             llama_url,
             bind_addr,
             database_url,
-            prompt_char_budget,
             static_dir,
+            prompt_char_budget,
             system_prompt,
         })
     }
 }
 
-fn var_or(name: &str, default: &str) -> String {
-    env::var(name).unwrap_or_else(|_| default.to_owned())
-}
+fn read_file() -> anyhow::Result<FileConfig> {
+    let (path, explicit) = match env::var("CONFIG_FILE") {
+        Ok(path) => (PathBuf::from(path), true),
+        Err(_) => (PathBuf::from("config.toml"), false),
+    };
 
-fn choose_system_prompt(file: Option<String>, inline: Option<String>) -> anyhow::Result<String> {
-    match (file, inline) {
-        (Some(text), _) => non_empty(text, "SYSTEM_PROMPT_FILE"),
-        (None, Some(text)) => non_empty(text, "SYSTEM_PROMPT"),
-        (None, None) => Ok(DEFAULT_SYSTEM_PROMPT.to_owned()),
+    match fs::read_to_string(&path) {
+        Ok(text) => {
+            toml::from_str(&text).with_context(|| format!("invalid config file {}", path.display()))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound && !explicit => Ok(FileConfig::default()),
+        Err(e) => Err(e).with_context(|| format!("could not read {}", path.display())),
     }
 }
 
@@ -75,21 +97,42 @@ fn choose_system_prompt(file: Option<String>, inline: Option<String>) -> anyhow:
 mod tests {
     use super::*;
 
-    #[test]
-    fn file_beats_inline_and_inline_beats_default() {
-        assert_eq!(
-            choose_system_prompt(Some("f".into()), Some("i".into())).unwrap(),
-            "f"
-        );
-        assert_eq!(choose_system_prompt(None, Some("i".into())).unwrap(), "i");
-        assert_eq!(
-            choose_system_prompt(None, None).unwrap(),
-            DEFAULT_SYSTEM_PROMPT
-        );
+    fn no_env(_: &str) -> Option<String> {
+        None
     }
 
     #[test]
-    fn blank_prompts_are_rejected() {
-        assert!(choose_system_prompt(None, Some("  \n".into())).is_err());
+    fn defaults_apply_when_nothing_is_set() {
+        let c = Config::resolve(FileConfig::default(), no_env).unwrap();
+        assert_eq!(c.system_prompt, DEFAULT_SYSTEM_PROMPT);
+        assert_eq!(c.prompt_char_budget, 6000);
+    }
+
+    #[test]
+    fn file_beats_default_and_env_beats_file() {
+        let file: FileConfig = toml::from_str("llama_url = 'http://file:1'").unwrap();
+        let c = Config::resolve(file, no_env).unwrap();
+        assert_eq!(c.llama_url, "http://file:1");
+
+        let file: FileConfig = toml::from_str("llama_url = 'http://file:1'").unwrap();
+        let c = Config::resolve(file, |name| {
+            (name == "LLAMA_URL").then(|| "http://env:2".to_owned())
+        })
+        .unwrap();
+        assert_eq!(c.llama_url, "http://env:2");
+    }
+
+    #[test]
+    fn unknown_keys_are_rejected() {
+        assert!(toml::from_str::<FileConfig>("llama_ulr = 'typo'").is_err());
+    }
+
+    #[test]
+    fn blank_prompt_and_bad_address_are_rejected() {
+        let blank: FileConfig = toml::from_str("system_prompt = '   '").unwrap();
+        assert!(Config::resolve(blank, no_env).is_err());
+
+        let bad: FileConfig = toml::from_str("bind_addr = 'nonsense'").unwrap();
+        assert!(Config::resolve(bad, no_env).is_err());
     }
 }
