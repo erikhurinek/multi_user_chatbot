@@ -20,6 +20,7 @@ use scheduler::SchedulerHandle;
 use scheduler::{Joined, Snapshot};
 use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
+use tower_http::services::ServeDir;
 use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -154,6 +155,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(|| async { "OK" }))
         .route("/ws", get(ws_handler))
+        .fallback_service(ServeDir::new(&config.static_dir))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;

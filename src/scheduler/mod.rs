@@ -138,6 +138,10 @@ impl SchedulerHandle {
     pub async fn disconnect(&self, owner: Uuid) {
         let _ = self.commands.send(Command::Disconnect { owner }).await;
     }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<Event> {
+        self.events.subscribe()
+    }
 }
 
 struct PartialReply {

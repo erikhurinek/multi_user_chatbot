@@ -1,0 +1,31 @@
+services:
+  llama:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    command: >
+      -hf Qwen/Qwen3-8B-GGUF:Q4_K_M
+      --host 0.0.0.0 --port 8080
+      -c 4096 -np 1 -t 4 --jinja --reasoning off
+    environment:
+      LLAMA_CACHE: /models
+    volumes:
+      - models:/models
+    restart: unless-stopped
+
+  chat:
+    build: .
+    environment:
+      LLAMA_URL: http://llama:8080
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - data:/data
+    depends_on:
+      - llama
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/health"]
+      interval: 30s
+    restart: unless-stopped
+
+volumes:
+  models:
+  data:

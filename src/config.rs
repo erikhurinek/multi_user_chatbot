@@ -7,6 +7,7 @@ pub struct Config {
     pub bind_addr: SocketAddr,
     pub database_url: String,
     pub prompt_char_budget: usize,
+    pub static_dir: std::path::PathBuf,
 }
 
 impl Config {
@@ -19,12 +20,14 @@ impl Config {
         let prompt_char_budget = var_or("PROMPT_CHAR_BUDGET", "6000")
             .parse()
             .context("PROMPT_CHAR_BUDGET must be a whole number")?;
+        let static_dir = var_or("STATIC_DIR", "./frontend/dist").into();
 
         Ok(Self {
             llama_url,
             bind_addr,
             database_url,
             prompt_char_budget,
+            static_dir,
         })
     }
 }
