@@ -7,8 +7,10 @@ services:
       -c 4096 -np 1 -t 4 --jinja --reasoning off
     environment:
       LLAMA_CACHE: /models
+      SYSTEM_PROMPT_FILE: /config/system_prompt.txt
     volumes:
       - models:/models
+      - ./config/system_prompt.txt:/config/system_prompt.txt:ro
     restart: unless-stopped
 
   chat:

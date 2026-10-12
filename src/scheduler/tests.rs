@@ -3,6 +3,7 @@ use std::time::Duration;
 use tokio::time::{sleep, timeout};
 
 use super::*;
+use crate::config::DEFAULT_SYSTEM_PROMPT;
 use crate::llm::fake::{FakeCall, fake_llm};
 
 const WAIT: Duration = Duration::from_secs(2);
@@ -23,7 +24,7 @@ impl Harness {
 
         let pool = db::connect_with("sqlite::memory:", 1).await.unwrap();
         let (fake, calls) = fake_llm();
-        let scheduler = spawn(fake, pool.clone(), 6000);
+        let scheduler = spawn(fake, pool.clone(), DEFAULT_SYSTEM_PROMPT.to_owned(), 6000);
         let events = scheduler.subscribe();
         Self {
             scheduler,

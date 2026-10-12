@@ -148,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
     let scheduler = scheduler::spawn(
         LlmClient::new(&config.llama_url),
         pool.clone(),
+        config.system_prompt.clone(),
         config.prompt_char_budget,
     );
     let state = AppState { scheduler };

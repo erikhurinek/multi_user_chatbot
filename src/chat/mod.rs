@@ -3,15 +3,13 @@ use crate::{
     llm::{Message, Role},
 };
 
-const SYSTEM_PROMPT: &str = "You are a helpful assistant in a shared chat room with several \
-participants. Each user message begins with the speaker's name followed by a colon. Use names \
-to tell people apart, but do not begin your own replies with a name. \
-Several people may write before you get a chance to reply. When that happens, \
-answer all of them in a single message, addressing each person by name where it helps.";
-
-pub fn build_context(history: Vec<StoredMessage>, char_budget: usize) -> Vec<Message> {
+pub fn build_context(
+    system_prompt: &str,
+    history: Vec<StoredMessage>,
+    char_budget: usize,
+) -> Vec<Message> {
     let mut chosen: Vec<Message> = Vec::new();
-    let mut used = 0;
+    let mut used = system_prompt.chars().count();
 
     for stored in history.into_iter().rev() {
         let Some(message) = to_message(stored) else {
@@ -27,7 +25,7 @@ pub fn build_context(history: Vec<StoredMessage>, char_budget: usize) -> Vec<Mes
 
     let mut messages = vec![Message {
         role: Role::System,
-        content: SYSTEM_PROMPT.to_owned(),
+        content: system_prompt.to_owned(),
     }];
     messages.extend(chosen);
     messages
@@ -45,6 +43,7 @@ fn to_message(stored: StoredMessage) -> Option<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DEFAULT_SYSTEM_PROMPT;
 
     fn msg(id: i64, role: &str, author: Option<&str>, content: &str) -> StoredMessage {
         StoredMessage {
@@ -64,7 +63,7 @@ mod tests {
             msg(2, "assistant", None, "second"),
             msg(3, "user", Some("b"), "third"),
         ];
-        let out = build_context(history, 20);
+        let out = build_context("", history, 20);
         let contents: Vec<_> = out.iter().map(|m| m.content.as_str()).collect();
         assert_eq!(contents[1..], ["second", "b: third"]);
     }
@@ -72,6 +71,7 @@ mod tests {
     #[test]
     fn always_keeps_the_newest_message() {
         let out = build_context(
+            DEFAULT_SYSTEM_PROMPT,
             vec![msg(1, "user", Some("a"), "far too long for this budget")],
             3,
         );
@@ -80,7 +80,11 @@ mod tests {
 
     #[test]
     fn labels_users_but_not_the_assistant() {
-        let out = build_context(vec![msg(1, "assistant", None, "hi")], 100);
+        let out = build_context(
+            DEFAULT_SYSTEM_PROMPT,
+            vec![msg(1, "assistant", None, "hi")],
+            100,
+        );
         assert_eq!(out[1].content, "hi");
     }
 }

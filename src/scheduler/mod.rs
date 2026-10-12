@@ -180,6 +180,7 @@ impl Active {
 pub fn spawn<B: ChatBackend>(
     backend: B,
     pool: SqlitePool,
+    system_prompt: String,
     prompt_char_budget: usize,
 ) -> SchedulerHandle {
     let (commands_tx, commands_rx) = mpsc::channel(32);
@@ -188,6 +189,7 @@ pub fn spawn<B: ChatBackend>(
     tokio::spawn(run(
         backend,
         pool,
+        system_prompt,
         prompt_char_budget,
         commands_rx,
         events_tx.clone(),
@@ -248,6 +250,7 @@ async fn stop_turn(pool: &SqlitePool, events: &broadcast::Sender<Event>, turn: A
 async fn run<B: ChatBackend>(
     backend: B,
     pool: SqlitePool,
+    system_prompt: String,
     prompt_char_budget: usize,
     mut commands: mpsc::Receiver<Command>,
     events: broadcast::Sender<Event>,
@@ -275,7 +278,7 @@ async fn run<B: ChatBackend>(
             match loaded {
                 Ok(history) => {
                     let turn_id = Uuid::new_v4();
-                    let messages = chat::build_context(history, prompt_char_budget);
+                    let messages = chat::build_context(&system_prompt, history, prompt_char_budget);
                     tracing::info!(%turn_id, prompts = batch.len(), "generation started");
                     let _ = events.send(Event::Started {
                         turn_id,

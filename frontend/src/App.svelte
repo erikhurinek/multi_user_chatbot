@@ -5,7 +5,8 @@
 
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
   const base = import.meta.env.BASE_URL.replace(/\/$/, '');
-  const chat = createChat(`${scheme}://${location.host}${base}/ws`);
+  const url = new URL(`${scheme}://${location.host}${base}/ws`);
+  const chat = createChat(url);
   onDestroy(chat.close);
 
   let draft = $state('');
