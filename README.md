@@ -2,6 +2,13 @@
 
 A local LLM with a web interface, allowing multiple users to chat together.
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./.github/demo-dark.png">
+    <img src="./.github/demo-light.png" width="400" />
+  </picture>
+</p>
+
 ## Building and Running
 
 Note that a minimum of 8 GB of RAM and a decent CPU is required to run the default model.
@@ -12,6 +19,7 @@ Note that a minimum of 8 GB of RAM and a decent CPU is required to run the defau
  - [Bun](https://bun.com/)
  - [Cargo](https://doc.rust-lang.org/cargo/)
  - [llama.cpp](https://github.com/ggml-org/llama.cpp)
+
 This application was tested with Bun 1.4.3 and Cargo 1.95.
 
 1. Build the Svelte frontend.
@@ -21,9 +29,11 @@ bun install
 bun run build
 ```
 
-2. Create the required configuration file.
+2. Create and the required configuration file, and ensure that it is readable.
 ```bash
 cp config.example.toml config.toml
+nano config.toml
+chmod a+r config.toml
 ```
 
 3. Build the Rust backend.
@@ -50,7 +60,7 @@ cargo run --release
 
 6. Access the application on [http://localhost:3000](http://localhost:3000).
 
-Note that the server `chat.db` will be created in the project root.
+Note that the database `chat.db` will be created in the project root.
 
 ### Method 2: Docker
 
@@ -66,7 +76,7 @@ cp config.example.toml config.toml
 docker compose up -d
 docker compose logs -f
 ```
-Note that the default model is quite large, around 5 GB.
+Note that the default model is large, at around 5 GB.
 
 3. Access the application on [http://localhost:3000](http://localhost:3000).
 
@@ -93,3 +103,8 @@ Note that the default model is quite large, around 5 GB.
 ├── README.md              # This file
 └── run-model.sh*          # Run Qwen3 8B llama-server with 4 threads
 ```
+
+## Configuration
+
+The `config.toml` file describes configuration parameters.
+These can also be overridden by environment variables.
